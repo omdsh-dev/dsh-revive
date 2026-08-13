@@ -1,0 +1,10 @@
+# dsh-revive bundle patch. The browser half is discovered through the
+# package dsh.client manifest; this row mounts the host half into the
+# composition (host-plane: session query + agent resume + command/tool/RPC).
+- insert:
+    - id: revive
+      name: dsh-revive
+      # config:
+      #   resumePrompt: 继续            # 复活时发送给会话的指令
+      #   autoReviveOnStartup: true    # DSH 启动后自动复活（默认关闭，防崩溃循环）
+      #   startupDelayMs: 5000          # 自动复活的启动延迟
