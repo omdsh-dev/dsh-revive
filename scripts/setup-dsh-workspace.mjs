@@ -8,6 +8,7 @@ const workspaceRoot = process.env.DSH_WORKSPACE_ROOT === undefined
 const links = {
   '@deepseek-ai/cordis': 'vendor/cordis',
   '@deepseek-ai/cordis-plugin-timer': 'vendor/timer',
+  '@deepseek-ai/schemastery': 'vendor/schemastery',
   '@deepseek-ai/dsh-agent': 'packages/core/agent',
   '@deepseek-ai/dsh-agent-default-model': 'packages/core/agent-default-model',
   '@deepseek-ai/dsh-agent-presets': 'packages/preset/agent-presets',

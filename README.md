@@ -29,24 +29,45 @@ DSH 进程经常在跑任务时被杀死（自己杀自己、OOM、崩溃……�
 
 ## 安装
 
-1. 把本目录 `link` 进 DSH profile 的依赖，并把 `dsh-revive` 加进 `dsh.profile.bundles`：
-   ```jsonc
-   // ~/.dsh/profiles/web/package.json
-   {
-     "dependencies": {
-       "dsh-revive": "link:/path/to/dsh-revive"
-     },
-     "dsh": {
-       "profile": {
-         "bundles": [ "@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", "dsh-revive" ]
-       }
-     }
-   }
-   ```
-2. 在 profile 目录执行 `pnpm install`，重启 DSH。
-3. 打开任意会话，输入框下方出现「⚡复活」按钮即安装成功。
+```bash
+# 已登录私有 npm registry 的 DSH 部署机
+dsh plugin --profile web add dsh-revive@0.1.3
 
-## 配置（`cordis.patch.yml` 行内 `config:`，均可选）
+# 本地开发 checkout
+dsh plugin --profile web add link:/path/to/dsh-revive
+```
+
+插件自带 Profile Bundle；`dsh plugin` 会自动维护 profile 依赖和
+`dsh.profile.bundles`。不要手工编辑 profile manifest，也不要再插入同名 `revive`
+loader entry，否则会触发 `duplicate loader entry id`。重启 DSH 后，任意会话输入框
+下方出现「⚡复活」按钮即安装成功。
+
+## 兼容性
+
+| 组件 | 支持范围 |
+|---|---|
+| DSH | `>=0.0.1-rc.2 <0.0.2` |
+| Node.js | `>=22.19.0` |
+| Profile | `web`（宿主命令/工具/RPC + 浏览器 dock） |
+
+0.1.3 以 DSH 0.0.1-rc.2 的 commands、agent resume、raw session persistence 和
+`dsh-client-ui-conversation` 契约为准。
+
+## 配置
+
+在 profile 自己的 `cordis.patch.yml` 中更新插件行；不要修改安装包内的 patch：
+
+```yaml
+- update:
+    id: revive
+    config:
+      resumePrompt: 继续
+      autoReviveOnStartup: false
+      startupDelayMs: 5000
+      scanTtlMs: 120000
+```
+
+所有键均可选：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
@@ -58,11 +79,13 @@ DSH 进程经常在跑任务时被杀死（自己杀自己、OOM、崩溃……�
 ## 开发
 
 ```bash
-npm install
-npm run setup:dsh-workspace   # 将 @deepseek-ai/* 内部包软链到本地 DSH 源码 checkout
+npm install --legacy-peer-deps
+DSH_WORKSPACE_ROOT=/path/to/dsh-rc2-source npm run setup:dsh-workspace
 npm run typecheck
 npm test
 npm run build                 # tsc（host 半部）+ tsdown（浏览器半部 lib/client.js）
+npm run test:oom              # 128 MiB V8 heap 下扫描 32 MiB raw JSONL
+npm pack                      # prepack 会重跑全部 gate
 ```
 
 依赖的真实类型在 `setup:dsh-workspace` 时从 DSH 源码 workspace 软链而来（内部包不在公共 npm 上）；若 checkout 路径不同，用 `DSH_WORKSPACE_ROOT=<path> npm run setup:dsh-workspace` 指定。
