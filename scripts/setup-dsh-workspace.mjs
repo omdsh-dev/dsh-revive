@@ -16,7 +16,7 @@ const links = {
   '@deepseek-ai/dsh-host-apiproxy': 'packages/host/apiproxy',
   '@deepseek-ai/dsh-llm': 'packages/llm/llm',
   '@deepseek-ai/dsh-session': 'packages/core/session',
-  '@deepseek-ai/dsh-session-query': 'packages/session-query/session-query',
+  '@deepseek-ai/dsh-session-persistence': 'packages/session/session-persistence',
   '@deepseek-ai/dsh-tools': 'packages/core/tools',
   '@deepseek-ai/dsh-client-connection': 'packages/client/connection',
   '@deepseek-ai/dsh-client-runtime': 'packages/client/runtime',

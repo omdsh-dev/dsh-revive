@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionRecord } from '@deepseek-ai/dsh-session-query'
 import { ReviveService } from '../src/service.ts'
 
 function header(id: string, extra: Partial<SessionHeader> = {}): SessionHeader {
@@ -15,37 +14,47 @@ function header(id: string, extra: Partial<SessionHeader> = {}): SessionHeader {
 }
 
 function ev(type: string, seq: number, data: Record<string, unknown> = {}): SessionEvent {
-  return { type, seq, time: 0, data } as SessionEvent
+  return { type, seq, time: seq, data } as SessionEvent
 }
 
-/** A session that died mid-turn. */
 const KILLED_EVENTS: readonly SessionEvent[] = [
-  ev('turn/start', 1, { turn: 1 }),
-  ev('user/message', 2, {}),
-  ev('assistant/message', 3, {}),
-  ev('tool/call', 4, { name: 'bash' }),
+  ev('turn/start', 0, { turn: 1 }),
+  ev('user/message', 1, {}),
+  ev('assistant/message', 2, {}),
+  ev('tool/call', 3, { name: 'bash' }),
 ]
 
-/** A cleanly finished session. */
 const CLEAN_EVENTS: readonly SessionEvent[] = [
-  ev('turn/start', 1, { turn: 1 }),
-  ev('assistant/message', 2, {}),
-  ev('turn/end', 3, { turn: 1, reason: { kind: 'completed' } }),
+  ev('turn/start', 0, { turn: 1 }),
+  ev('assistant/message', 1, {}),
+  ev('turn/end', 2, { turn: 1, reason: { kind: 'completed' } }),
 ]
+
+function rawLog(meta: SessionHeader, events: readonly SessionEvent[]): string {
+  return [
+    JSON.stringify({ type: 'session', ...meta }),
+    ...events.map(event => JSON.stringify(event)),
+    '',
+  ].join('\n')
+}
 
 interface HarnessOptions {
-  records: SessionRecord[]
+  headers: SessionHeader[]
   logs: Map<string, readonly SessionEvent[]>
   live?: Map<string, { status: 'idle' | 'running'; events: readonly SessionEvent[] }>
-  scanConcurrency?: number
+  revisions?: Map<string, string>
+  supportsRawArtifacts?: boolean
   scanTtlMs?: number
+  resolveAgent?: (sessionId: SessionId, inspected: { meta: SessionHeader; events: readonly SessionEvent[] }) => Promise<Agent>
 }
 
-/** Assemble a fake host ctx + service around it. */
 function harness(options: HarnessOptions) {
   const followed: Array<{ sessionId: string; text: string }> = []
   const resumed: string[] = []
-  const resolveAgent = vi.fn(async (sessionId: SessionId, inspected: { meta: SessionHeader; events: readonly SessionEvent[] }) => {
+  const defaultResolveAgent = vi.fn(async (
+    sessionId: SessionId,
+    inspected: { meta: SessionHeader; events: readonly SessionEvent[] },
+  ) => {
     resumed.push(sessionId)
     return {
       id: sessionId,
@@ -56,24 +65,34 @@ function harness(options: HarnessOptions) {
       },
     } as unknown as Agent
   })
+  const resolveAgent = vi.fn(options.resolveAgent ?? defaultResolveAgent)
   const persistence = {
-    list: vi.fn(async () => options.records.map(record => record.header)),
-    inspect: vi.fn(async (sessionId: SessionId) => {
-      const record = options.records.find(candidate => candidate.header.id === sessionId)
-      if (record === undefined) throw new Error('not found')
-      return { meta: record.header, events: options.logs.get(sessionId) ?? [] }
+    supportsRawArtifacts: options.supportsRawArtifacts ?? true,
+    list: vi.fn(async () => options.headers),
+    listSnapshots: vi.fn(async () => options.headers.map(meta => ({
+      header: meta,
+      revision: (options.revisions?.get(meta.id) ?? `revision:${meta.id}:1`) as never,
+    }))),
+    readRaw: vi.fn(async (sessionId: SessionId) => {
+      const meta = options.headers.find(candidate => candidate.id === sessionId)
+      if (meta === undefined) return undefined
+      return { meta, filename: 'session.jsonl', content: rawLog(meta, options.logs.get(sessionId) ?? []) }
     }),
+    inspect: vi.fn(async (sessionId: SessionId) => {
+      const meta = options.headers.find(candidate => candidate.id === sessionId)
+      if (meta === undefined) throw new Error('not found')
+      return { meta, events: options.logs.get(sessionId) ?? [] }
+    }),
+    readFrom: vi.fn(() => Promise.reject(new Error('forbidden readFrom'))),
+  }
+  const forbidden = {
+    listSessions: vi.fn(() => Promise.reject(new Error('forbidden listSessions'))),
+    readSession: vi.fn(() => Promise.reject(new Error('forbidden readSession'))),
+    readTitleSnapshots: vi.fn(() => Promise.reject(new Error('forbidden readTitleSnapshots'))),
   }
   const ctx = {
-    sessionQuery: {
-      listSessions: vi.fn(async () => [...options.records]),
-      readSession: vi.fn(async (sessionId: SessionId) => ({ events: options.logs.get(sessionId) ?? [] })),
-      readTitleSnapshots: vi.fn(async (ids: readonly SessionId[]) => ids.map(sessionId => ({
-        sessionId,
-        status: 'fulfilled' as const,
-        value: { title: { title: `标题 ${sessionId}` } },
-      }))),
-    },
+    sessionPersistence: persistence,
+    sessionQuery: forbidden,
     agents: {
       get: (sessionId: SessionId) => {
         const entry = options.live?.get(sessionId)
@@ -91,8 +110,7 @@ function harness(options: HarnessOptions) {
     sessions: {
       get: (sessionId: SessionId) => {
         const entry = options.live?.get(sessionId)
-        if (entry === undefined) return undefined
-        return { events: entry.events }
+        return entry === undefined ? undefined : { events: entry.events }
       },
     },
     get: (name: string) => (name === 'sessionPersistence'
@@ -104,195 +122,213 @@ function harness(options: HarnessOptions) {
   const service = new ReviveService(ctx as never, {
     prompt: () => '继续',
     scanTtlMs: options.scanTtlMs ?? 0,
-    scanConcurrency: options.scanConcurrency,
     resolveAgent,
   })
-  return { ctx, service, followed, resumed, resolveAgent }
+  return { ctx, persistence, forbidden, service, followed, resumed, resolveAgent }
 }
 
 describe('ReviveService.scan', () => {
-  it('reports only interrupted project-backed sessions', async () => {
-    const { service } = harness({
-      records: [
-        { header: header('a'), live: false, persisted: true },
-        { header: header('b'), live: false, persisted: true },
-        { header: header('c', { cwd: undefined }), live: false, persisted: true },
-        { header: header('d', { origin: 'subagent' }), live: false, persisted: true },
-      ],
-      logs: new Map([
-        ['a', KILLED_EVENTS],
-        ['b', CLEAN_EVENTS],
-      ]),
+  it('reports only interrupted project-backed sessions from raw artifacts', async () => {
+    const headers = [
+      header('a'),
+      header('b'),
+      header('c', { cwd: undefined }),
+      header('d', { origin: 'subagent' }),
+    ]
+    const { service, persistence, forbidden } = harness({
+      headers,
+      logs: new Map([['a', KILLED_EVENTS], ['b', CLEAN_EVENTS]]),
     })
+
     const snapshot = await service.scan(true)
-    expect(snapshot.items).toHaveLength(1)
-    expect(snapshot.items[0]).toMatchObject({
-      sessionId: 'a',
-      reason: 'killed-mid-turn',
-      live: false,
-      title: '标题 a',
-    })
+    expect(snapshot.items).toEqual([expect.objectContaining({
+      sessionId: 'a', reason: 'killed-mid-turn', live: false,
+    })])
     expect(snapshot.skipped).toBe(2)
     expect(snapshot.totalPersisted).toBe(4)
+    expect(persistence.readRaw).toHaveBeenCalledTimes(2)
+    expect(forbidden.listSessions).not.toHaveBeenCalled()
+    expect(forbidden.readSession).not.toHaveBeenCalled()
+    expect(forbidden.readTitleSnapshots).not.toHaveBeenCalled()
+    expect(persistence.readFrom).not.toHaveBeenCalled()
+    expect(persistence.inspect).not.toHaveBeenCalled()
   })
 
-  it('includes live idle agents whose last turn was interrupted', async () => {
-    const { service } = harness({
-      records: [{ header: header('a'), live: true, persisted: true }],
+  it('uses an interrupted live idle log without reading its raw artifact', async () => {
+    const meta = header('a')
+    const { service, persistence } = harness({
+      headers: [meta],
       logs: new Map(),
       live: new Map([['a', { status: 'idle', events: KILLED_EVENTS }]]),
     })
     const snapshot = await service.scan(true)
-    expect(snapshot.items).toHaveLength(1)
-    expect(snapshot.items[0].live).toBe(true)
+    expect(snapshot.items).toEqual([expect.objectContaining({ sessionId: 'a', live: true })])
+    expect(persistence.readRaw).not.toHaveBeenCalled()
   })
 
   it('leaves live running agents alone', async () => {
-    const { service } = harness({
-      records: [{ header: header('a'), live: true, persisted: true }],
+    const meta = header('a')
+    const { service, persistence } = harness({
+      headers: [meta],
       logs: new Map(),
       live: new Map([['a', { status: 'running', events: KILLED_EVENTS }]]),
     })
     const snapshot = await service.scan(true)
     expect(snapshot.items).toHaveLength(0)
     expect(snapshot.runningLive).toBe(1)
+    expect(persistence.readRaw).not.toHaveBeenCalled()
   })
 
-  it('serializes cold reads by default', async () => {
-    const records = Array.from({ length: 3 }, (_, index) => ({
-      header: header(String(index)),
-      live: false,
-      persisted: true,
-    }))
-    const { service, ctx } = harness({ records, logs: new Map() })
+  it('keeps raw artifact reads strictly serial', async () => {
+    const headers = Array.from({ length: 3 }, (_, index) => header(String(index)))
+    const { service, persistence } = harness({ headers, logs: new Map() })
     let active = 0
     let maxActive = 0
     let releaseReads!: () => void
-    const readGate = new Promise<void>(resolve => { releaseReads = resolve })
-    ctx.sessionQuery.readSession.mockImplementation(async () => {
+    const gate = new Promise<void>(resolve => { releaseReads = resolve })
+    persistence.readRaw.mockImplementation(async (id: SessionId) => {
       active += 1
       maxActive = Math.max(maxActive, active)
-      await readGate
+      await gate
       active -= 1
-      return { events: KILLED_EVENTS }
+      const meta = headers.find(candidate => candidate.id === id)!
+      return { meta, filename: 'session.jsonl', content: rawLog(meta, KILLED_EVENTS) }
     })
 
     const pending = service.scan(true)
-    await vi.waitFor(() => expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(persistence.readRaw).toHaveBeenCalledTimes(1))
     expect(maxActive).toBe(1)
-    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(1)
-
     releaseReads()
     const snapshot = await pending
-    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(3)
+    expect(persistence.readRaw).toHaveBeenCalledTimes(3)
     expect(maxActive).toBe(1)
     expect(snapshot.items).toHaveLength(3)
   })
 
-  it('starts cold reads lazily and never exceeds scanConcurrency', async () => {
-    const records = Array.from({ length: 6 }, (_, index) => ({
-      header: header(String(index)),
-      live: false,
-      persisted: true,
-    }))
-    const { service, ctx } = harness({
-      records,
-      logs: new Map(),
-      scanConcurrency: 2,
-    })
-    let active = 0
-    let maxActive = 0
-    let releaseReads!: () => void
-    const readGate = new Promise<void>(resolve => { releaseReads = resolve })
-    ctx.sessionQuery.readSession.mockImplementation(async () => {
-      active += 1
-      maxActive = Math.max(maxActive, active)
-      await readGate
-      active -= 1
-      return { events: KILLED_EVENTS }
-    })
+  it('reuses revision-matched projections and refreshes only changed revisions', async () => {
+    const meta = header('a')
+    const revisions = new Map([['a', 'r1']])
+    const logs = new Map<string, readonly SessionEvent[]>([['a', KILLED_EVENTS]])
+    const { service, persistence } = harness({ headers: [meta], logs, revisions })
 
-    const pending = service.scan(true)
-    await vi.waitFor(() => expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(2))
-    expect(maxActive).toBe(2)
-    // If reads were represented by eager Promises, all six calls would have
-    // started before this gate was released.
-    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(2)
+    expect((await service.scan(true)).items).toHaveLength(1)
+    expect((await service.scan(true)).items).toHaveLength(1)
+    expect(persistence.readRaw).toHaveBeenCalledTimes(1)
 
-    releaseReads()
-    const snapshot = await pending
-    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(6)
-    expect(maxActive).toBe(2)
-    expect(snapshot.items).toHaveLength(6)
+    revisions.set('a', 'r2')
+    logs.set('a', CLEAN_EVENTS)
+    expect((await service.scan(true)).items).toHaveLength(0)
+    expect(persistence.readRaw).toHaveBeenCalledTimes(2)
   })
 
-  it('shares an in-flight scan and lets force bypass only a completed cache', async () => {
-    const { service, ctx } = harness({
-      records: [],
-      logs: new Map(),
+  it('retries one changing revision once and adopts only the stable retry', async () => {
+    const meta = header('a')
+    const { service, persistence } = harness({
+      headers: [meta],
+      logs: new Map([['a', CLEAN_EVENTS]]),
+    })
+    persistence.listSnapshots
+      .mockResolvedValueOnce([{ header: meta, revision: 'r1' as never }])
+      .mockResolvedValueOnce([{ header: meta, revision: 'r2' as never }])
+      .mockResolvedValueOnce([{ header: meta, revision: 'r2' as never }])
+    persistence.readRaw
+      .mockResolvedValueOnce({ meta, filename: 'session.jsonl', content: rawLog(meta, KILLED_EVENTS) })
+      .mockResolvedValueOnce({ meta, filename: 'session.jsonl', content: rawLog(meta, CLEAN_EVENTS) })
+
+    const snapshot = await service.scan(true)
+    expect(snapshot.items).toHaveLength(0)
+    expect(snapshot.skipped).toBe(0)
+    expect(persistence.readRaw).toHaveBeenCalledTimes(2)
+    expect(persistence.listSnapshots).toHaveBeenCalledTimes(3)
+  })
+
+  it('skips a session that changes again during its single retry', async () => {
+    const meta = header('a')
+    const { service, persistence } = harness({ headers: [meta], logs: new Map([['a', KILLED_EVENTS]]) })
+    persistence.listSnapshots
+      .mockResolvedValueOnce([{ header: meta, revision: 'r1' as never }])
+      .mockResolvedValueOnce([{ header: meta, revision: 'r2' as never }])
+      .mockResolvedValueOnce([{ header: meta, revision: 'r3' as never }])
+
+    const snapshot = await service.scan(true)
+    expect(snapshot.items).toHaveLength(0)
+    expect(snapshot.skipped).toBe(1)
+    expect(persistence.readRaw).toHaveBeenCalledTimes(2)
+  })
+
+  it('shares an in-flight scan; force bypasses only a completed cache', async () => {
+    const meta = header('a')
+    const { service, persistence } = harness({
+      headers: [meta],
+      logs: new Map([['a', KILLED_EVENTS]]),
+      revisions: new Map([['a', 'r1']]),
       scanTtlMs: 60_000,
     })
-    let releaseList!: (records: SessionRecord[]) => void
-    const listGate = new Promise<SessionRecord[]>(resolve => { releaseList = resolve })
-    ctx.sessionQuery.listSessions.mockImplementationOnce(() => listGate)
+    let releaseList!: (value: Array<{ header: SessionHeader; revision: never }>) => void
+    const gate = new Promise<Array<{ header: SessionHeader; revision: never }>>(resolve => { releaseList = resolve })
+    persistence.listSnapshots.mockImplementationOnce(() => gate)
 
     const first = service.scan()
-    const concurrent = service.scan()
-    const forcedConcurrent = service.scan(true)
-    expect(concurrent).toBe(first)
-    expect(forcedConcurrent).toBe(first)
-    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(1)
-
-    releaseList([])
+    expect(service.scan()).toBe(first)
+    expect(service.scan(true)).toBe(first)
+    expect(persistence.listSnapshots).toHaveBeenCalledTimes(1)
+    releaseList([{ header: meta, revision: 'r1' as never }])
     const completed = await first
-    expect(await service.scan()).toBe(completed)
-    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(1)
 
-    const forcedRefresh = service.scan(true)
-    expect(forcedRefresh).not.toBe(first)
-    await forcedRefresh
-    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(2)
+    expect(await service.scan()).toBe(completed)
+    const forced = service.scan(true)
+    expect(forced).not.toBe(first)
+    await forced
+    expect(persistence.readRaw).toHaveBeenCalledTimes(1)
   })
 
   it('clears the in-flight scan after rejection so a later call can retry', async () => {
-    const { service, ctx } = harness({ records: [], logs: new Map() })
-    ctx.sessionQuery.listSessions.mockRejectedValueOnce(new Error('scan exploded'))
-
+    const { service, persistence } = harness({ headers: [], logs: new Map() })
+    persistence.listSnapshots.mockRejectedValueOnce(new Error('scan exploded'))
     await expect(service.scan(true)).rejects.toThrow('scan exploded')
     await expect(service.scan(true)).resolves.toMatchObject({ totalPersisted: 0 })
-    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(2)
+  })
+
+  it('skips cold sessions on a backend without raw artifacts and never falls back', async () => {
+    const { service, persistence, forbidden } = harness({
+      headers: [header('a')],
+      logs: new Map([['a', KILLED_EVENTS]]),
+      supportsRawArtifacts: false,
+    })
+    const snapshot = await service.scan(true)
+    expect(snapshot.items).toHaveLength(0)
+    expect(snapshot.skipped).toBe(1)
+    expect(persistence.readRaw).not.toHaveBeenCalled()
+    expect(persistence.inspect).not.toHaveBeenCalled()
+    expect(persistence.readFrom).not.toHaveBeenCalled()
+    expect(forbidden.readSession).not.toHaveBeenCalled()
+    expect(forbidden.readTitleSnapshots).not.toHaveBeenCalled()
   })
 })
 
 describe('ReviveService.reviveAll', () => {
   it('cold-resumes each interrupted session and follows up with the prompt', async () => {
-    const { service, followed, resumed, ctx } = harness({
-      records: [
-        { header: header('a'), live: false, persisted: true },
-        { header: header('b'), live: false, persisted: true },
-      ],
-      logs: new Map([
-        ['a', KILLED_EVENTS],
-        ['b', KILLED_EVENTS],
-      ]),
+    const headers = [header('a'), header('b')]
+    const { service, followed, resumed, persistence } = harness({
+      headers,
+      logs: new Map([['a', KILLED_EVENTS], ['b', KILLED_EVENTS]]),
     })
     const result = await service.reviveAll()
     expect(result.revived).toHaveLength(2)
     expect(result.failed).toHaveLength(0)
     expect(resumed.sort()).toEqual(['a', 'b'])
     expect(followed).toHaveLength(2)
-    for (const entry of followed) expect(entry.text).toBe('继续')
-    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(2)
+    expect(persistence.inspect).toHaveBeenCalledTimes(2)
   })
 
   it('pokes a live idle agent without resuming from persistence', async () => {
+    const meta = header('a')
     const { service, followed, resumed } = harness({
-      records: [{ header: header('a'), live: true, persisted: true }],
+      headers: [meta],
       logs: new Map(),
       live: new Map([['a', { status: 'idle', events: KILLED_EVENTS }]]),
     })
     const result = await service.reviveAll()
-    expect(result.revived).toHaveLength(1)
     expect(result.revived[0]).toMatchObject({ sessionId: 'a', resumedFromCold: false })
     expect(resumed).toHaveLength(0)
     expect(followed[0]?.text).toBe('继续')
@@ -300,39 +336,15 @@ describe('ReviveService.reviveAll', () => {
 
   it('collects per-session failures without stopping the sweep', async () => {
     const boom = new Error('resume exploded')
-    const records = [
-      { header: header('a'), live: false, persisted: true },
-      { header: header('b'), live: false, persisted: true },
-    ]
-    const logs = new Map([
-      ['a', KILLED_EVENTS],
-      ['b', KILLED_EVENTS],
-    ])
-    const resolveAgent = vi.fn(async (sessionId: SessionId) => {
+    const resolveAgent = async (sessionId: SessionId) => {
       if (sessionId === 'a') throw boom
       return { id: sessionId, status: 'idle', followup: vi.fn() } as unknown as Agent
-    })
-    const ctx = {
-      sessionQuery: {
-        listSessions: vi.fn(async () => records),
-        readSession: vi.fn(async (sessionId: SessionId) => ({ events: logs.get(sessionId) ?? [] })),
-        readTitleSnapshots: vi.fn(async (ids: readonly SessionId[]) => ids.map(sessionId => ({
-          sessionId, status: 'fulfilled' as const, value: {},
-        }))),
-      },
-      agents: { get: () => undefined, resume: vi.fn() },
-      sessions: { get: () => undefined },
-      get: (name: string) => (name === 'sessionPersistence'
-        ? {
-            list: vi.fn(async () => records.map(record => record.header)),
-            inspect: vi.fn(async (sessionId: SessionId) => ({
-              meta: records.find(record => record.header.id === sessionId)!.header,
-              events: logs.get(sessionId) ?? [],
-            })),
-          }
-        : undefined),
     }
-    const service = new ReviveService(ctx as never, { prompt: () => '继续', scanTtlMs: 0, resolveAgent })
+    const { service } = harness({
+      headers: [header('a'), header('b')],
+      logs: new Map([['a', KILLED_EVENTS], ['b', KILLED_EVENTS]]),
+      resolveAgent,
+    })
     const result = await service.reviveAll()
     expect(result.revived).toHaveLength(1)
     expect(result.revived[0].sessionId).toBe('b')

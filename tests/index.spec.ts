@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { readFileSync } from 'node:fs'
 
 const indexMocks = vi.hoisted(() => ({
   serviceOptions: [] as Array<Record<string, unknown>>,
@@ -12,7 +13,7 @@ vi.mock('../src/service.ts', () => ({
   },
 }))
 
-import { Config, apply } from '../src/index.ts'
+import { Config, apply, inject } from '../src/index.ts'
 
 describe('dsh-revive config', () => {
   beforeEach(() => { indexMocks.serviceOptions.length = 0 })
@@ -23,19 +24,29 @@ describe('dsh-revive config', () => {
       autoReviveOnStartup: false,
       startupDelayMs: 5_000,
       scanTtlMs: 120_000,
-      scanConcurrency: 1,
     })
-    expect(() => Config({ scanConcurrency: 0 })).toThrow()
   })
 
-  it('passes configured scanConcurrency through to ReviveService', () => {
+  it('requires direct persistence instead of session-query projections', () => {
+    expect(inject).toContain('sessionPersistence')
+    expect(inject).not.toContain('sessionQuery')
+  })
+
+  it('waits for the client module that declares the composer slot', () => {
+    const manifest = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+      dsh: { client: { inject: string[] } }
+    }
+    expect(manifest.dsh.client.inject).toContain('@deepseek-ai/dsh-client-ui-conversation')
+    expect(manifest.dsh.client.inject).not.toContain('@deepseek-ai/dsh-client-ui-slots')
+  })
+
+  it('passes resolved scan settings through to ReviveService', () => {
     const ctx = { effect: vi.fn() }
-    apply(ctx as never, Config({ resumePrompt: 'go', scanConcurrency: 3 }))
+    apply(ctx as never, Config({ resumePrompt: 'go', scanTtlMs: 30_000 }))
 
     expect(indexMocks.serviceOptions).toHaveLength(1)
     expect(indexMocks.serviceOptions[0]).toMatchObject({
-      scanTtlMs: 120_000,
-      scanConcurrency: 3,
+      scanTtlMs: 30_000,
     })
     expect((indexMocks.serviceOptions[0].prompt as () => string)()).toBe('go')
   })

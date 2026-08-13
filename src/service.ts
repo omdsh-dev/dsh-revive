@@ -20,10 +20,15 @@ import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
 import { ApiRemoteSessionNotFound, inspectApiRemoteSession } from '@deepseek-ai/dsh-api-remotes'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent, SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
-import type { SessionRecord } from '@deepseek-ai/dsh-session-query'
-import { detectHealth, lastRequestConfig, type InterruptReason } from './detect.ts'
+import type SessionPersistence from '@deepseek-ai/dsh-session-persistence'
+import type {
+  SessionPersistenceRevision,
+  SessionPersistenceSnapshot,
+} from '@deepseek-ai/dsh-session-persistence'
+import { detectHealth, lastRequestConfig, type InterruptReason, type SessionHealth } from './detect.ts'
+import { detectRawHealth } from './raw-health.ts'
 // Type-only: pull the Context interface merges the service types ride on
-// (`sessionQuery`, `agents`, `sessions`, `agentPresets`, `agentDefaultModel`).
+// (`sessionPersistence`, `agents`, `sessions`, `agentPresets`, `agentDefaultModel`).
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-agent-default-model'
 
@@ -43,7 +48,7 @@ export interface ReviveScanResult {
   readonly totalPersisted: number
   /** Live agents that are currently running (not touched). */
   readonly runningLive: number
-  /** Records skipped as subagent-owned or project-less. */
+  /** Records skipped as ineligible, transient, unreadable, or unsafe to project. */
   readonly skipped: number
   readonly generatedAt: number
 }
@@ -80,8 +85,6 @@ export interface ReviveServiceOptions {
   readonly prompt: () => string
   /** Snapshot cache TTL in milliseconds. */
   readonly scanTtlMs?: number
-  /** Scan batch size for cold-log reads. */
-  readonly scanConcurrency?: number
   /**
    * Resolve one session to a live Agent: live reuse, cold resume.
    * Injectable for tests; defaults to the production implementation.
@@ -89,19 +92,19 @@ export interface ReviveServiceOptions {
   resolveAgent?: (sessionId: SessionId, inspected: InspectedSession) => Promise<Agent>
 }
 
-interface WorkItem {
-  readonly record: SessionRecord
-  /** Start loading this session's events only when a scan worker is ready. */
-  readonly readEvents: () => Promise<readonly SessionEvent[]> | readonly SessionEvent[]
+interface ColdProjection {
+  readonly health: SessionHealth
 }
 
 const DEFAULT_SCAN_TTL_MS = 120_000
-/** Serialize cold-log reads by default: one giant log can approach the V8 heap limit alone. */
-export const DEFAULT_SCAN_CONCURRENCY = 1
 
 export class ReviveService {
   private cache: { readonly at: number; readonly result: ReviveScanResult } | undefined
   private scanInFlight: Promise<ReviveScanResult> | undefined
+  private readonly coldCache = new Map<SessionId, {
+    readonly revision: SessionPersistenceRevision
+    readonly projection: ColdProjection
+  }>()
   private readonly inFlight = new Map<string, Promise<Agent>>()
   private readonly resolveAgent: (sessionId: SessionId, inspected: InspectedSession) => Promise<Agent>
 
@@ -143,22 +146,25 @@ export class ReviveService {
   /** Perform one uncached corpus walk. Call through {@link scan}. */
   private async scanCorpus(): Promise<ReviveScanResult> {
     const generatedAt = Date.now()
-    const records = await this.ctx.sessionQuery.listSessions()
-    const work: WorkItem[] = []
+    const persistence = this.ctx.sessionPersistence
+    const before = await persistence.listSnapshots()
+    const candidates: ReviveCandidate[] = []
+    const cold: SessionPersistenceSnapshot[] = []
     let runningLive = 0
     let skipped = 0
-    for (const record of records) {
-      const header = record.header
-      if (header.cwd === undefined || header.origin === 'subagent') {
+
+    for (const snapshot of before) {
+      const { header } = snapshot
+      if (!isEligible(header)) {
         skipped += 1
         continue
       }
-      if (record.live) {
-        const agent = this.ctx.agents.get(header.id)
-        const session = this.ctx.sessions.get(header.id)
+      const agent = this.ctx.agents.get(header.id)
+      const session = this.ctx.sessions.get(header.id)
+      if (agent !== undefined || session !== undefined) {
+        // A half-attached live identity is transient. Treat it as unavailable;
+        // a raw cold result could race the store entry it is becoming.
         if (agent === undefined || session === undefined) {
-          // Attached without a live agent: transient in-process state; never
-          // resume into it (a cold resume would collide with the store entry).
           skipped += 1
           continue
         }
@@ -166,59 +172,117 @@ export class ReviveService {
           runningLive += 1
           continue
         }
-        work.push({ record, readEvents: () => session.events })
+        const health = detectHealth(session.events)
+        if (health.state === 'interrupted') {
+          candidates.push(candidateOf(header, health.reason, true))
+        }
         continue
       }
-      work.push({
-        record,
-        readEvents: async () => (await this.ctx.sessionQuery.readSession(header.id)).events,
-      })
+      cold.push(snapshot)
     }
 
-    const requestedConcurrency = this.options.scanConcurrency ?? DEFAULT_SCAN_CONCURRENCY
-    const concurrency = Number.isFinite(requestedConcurrency) && requestedConcurrency > 0
-      ? Math.max(1, Math.floor(requestedConcurrency))
-      : DEFAULT_SCAN_CONCURRENCY
-    const candidates: Array<ReviveCandidate | undefined> = new Array(work.length)
-    let nextIndex = 0
-    const worker = async (): Promise<void> => {
-      while (nextIndex < work.length) {
-        const index = nextIndex
-        nextIndex += 1
-        const item = work[index]
-        try {
-          const events = await item.readEvents()
-          const health = detectHealth(events)
-          if (health.state === 'interrupted') {
-            candidates[index] = {
-              sessionId: item.record.header.id,
-              reason: health.reason,
-              live: item.record.live,
-              createdAt: item.record.header.createdAt,
-            }
+    const skippedCold = new Set<SessionId>()
+    let latest: SessionPersistenceSnapshot[]
+    if (!persistence.supportsRawArtifacts) {
+      for (const snapshot of cold) skippedCold.add(snapshot.header.id)
+      latest = await persistence.listSnapshots()
+    } else {
+      const first = await this.projectColdSerial(persistence, cold)
+      const after = await persistence.listSnapshots()
+      const afterById = snapshotsById(after)
+      const retry: SessionPersistenceSnapshot[] = []
+
+      for (const snapshot of cold) {
+        const observed = afterById.get(snapshot.header.id)
+        const projection = first.get(snapshot.header.id)
+        if (observed !== undefined && observed.revision === snapshot.revision) {
+          if (projection === undefined) skippedCold.add(snapshot.header.id)
+          else if (!this.acceptCold(observed, projection, candidates)) skippedCold.add(snapshot.header.id)
+          continue
+        }
+        if (observed === undefined || !isEligible(observed.header)) skippedCold.add(snapshot.header.id)
+        else retry.push(observed)
+      }
+
+      if (retry.length === 0) {
+        latest = after
+      } else {
+        const second = await this.projectColdSerial(persistence, retry)
+        latest = await persistence.listSnapshots()
+        const finalById = snapshotsById(latest)
+        for (const snapshot of retry) {
+          const observed = finalById.get(snapshot.header.id)
+          const projection = second.get(snapshot.header.id)
+          if (observed !== undefined && observed.revision === snapshot.revision && projection !== undefined) {
+            if (!this.acceptCold(observed, projection, candidates)) skippedCold.add(snapshot.header.id)
+          } else {
+            skippedCold.add(snapshot.header.id)
           }
-        } catch {
-          // Preserve the previous allSettled behavior: one unreadable session
-          // does not prevent the rest of the persisted corpus from being scanned.
         }
       }
     }
-    await Promise.all(Array.from(
-      { length: Math.min(concurrency, work.length) },
-      () => worker(),
-    ))
-    const items = candidates.filter((candidate): candidate is ReviveCandidate => candidate !== undefined)
 
-    const titles = await this.titlesFor(items.map(item => item.sessionId))
-    const titled = items.map((item, index) => ({ ...item, title: titles[index] }))
+    this.pruneColdCache(latest)
+    skipped += skippedCold.size
+    candidates.sort((left, right) => right.createdAt - left.createdAt
+      || String(left.sessionId).localeCompare(String(right.sessionId)))
     const result: ReviveScanResult = {
-      items: titled,
-      totalPersisted: records.length,
+      items: candidates,
+      totalPersisted: before.length,
       runningLive,
       skipped,
       generatedAt,
     }
     return result
+  }
+
+  /** Project raw artifacts one at a time; this concurrency is intentionally not configurable. */
+  private async projectColdSerial(
+    persistence: SessionPersistence,
+    snapshots: readonly SessionPersistenceSnapshot[],
+  ): Promise<Map<SessionId, ColdProjection>> {
+    const projected = new Map<SessionId, ColdProjection>()
+    for (const snapshot of snapshots) {
+      const { id } = snapshot.header
+      const cached = this.coldCache.get(id)
+      if (cached?.revision === snapshot.revision) {
+        projected.set(id, cached.projection)
+        continue
+      }
+      try {
+        const raw = await persistence.readRaw(id)
+        if (raw === undefined || raw.meta.id !== id) continue
+        projected.set(id, { health: detectRawHealth(raw.content) })
+      } catch {
+        // One absent, corrupt, or unreadable artifact must not discard peers.
+      }
+    }
+    return projected
+  }
+
+  /** Commit one revision-stable projection to the tiny process cache and result set. */
+  private acceptCold(
+    snapshot: SessionPersistenceSnapshot,
+    projection: ColdProjection,
+    candidates: ReviveCandidate[],
+  ): boolean {
+    const { id } = snapshot.header
+    // If this identity attached while its artifact was read, never publish the
+    // cold observation; the next scan will inspect the authoritative live log.
+    if (this.ctx.agents.get(id) !== undefined || this.ctx.sessions.get(id) !== undefined) return false
+    this.coldCache.set(id, { revision: snapshot.revision, projection })
+    if (projection.health.state === 'interrupted') {
+      candidates.push(candidateOf(snapshot.header, projection.health.reason, false))
+    }
+    return true
+  }
+
+  /** Drop projections whose durable identity disappeared or advanced. */
+  private pruneColdCache(snapshots: readonly SessionPersistenceSnapshot[]): void {
+    const latest = snapshotsById(snapshots)
+    for (const [id, cached] of this.coldCache) {
+      if (latest.get(id)?.revision !== cached.revision) this.coldCache.delete(id)
+    }
   }
 
   /** Revive every session the current scan reports as interrupted. */
@@ -312,10 +376,22 @@ export class ReviveService {
     return handle.agent
   }
 
-  /** Batch-read titles for the given ids; failures degrade to undefined. */
-  private async titlesFor(ids: readonly SessionId[]): Promise<Array<string | undefined>> {
-    if (ids.length === 0) return []
-    const results = await this.ctx.sessionQuery.readTitleSnapshots(ids)
-    return results.map(result => (result.status === 'fulfilled' ? result.value.title?.title : undefined))
-  }
+}
+
+function isEligible(header: SessionHeader): boolean {
+  return header.cwd !== undefined && header.origin !== 'subagent'
+}
+
+function candidateOf(
+  header: SessionHeader,
+  reason: InterruptReason,
+  live: boolean,
+): ReviveCandidate {
+  return { sessionId: header.id, reason, live, createdAt: header.createdAt }
+}
+
+function snapshotsById(
+  snapshots: readonly SessionPersistenceSnapshot[],
+): Map<SessionId, SessionPersistenceSnapshot> {
+  return new Map(snapshots.map(snapshot => [snapshot.header.id, snapshot]))
 }
