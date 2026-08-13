@@ -37,6 +37,8 @@ interface HarnessOptions {
   records: SessionRecord[]
   logs: Map<string, readonly SessionEvent[]>
   live?: Map<string, { status: 'idle' | 'running'; events: readonly SessionEvent[] }>
+  scanConcurrency?: number
+  scanTtlMs?: number
 }
 
 /** Assemble a fake host ctx + service around it. */
@@ -101,7 +103,8 @@ function harness(options: HarnessOptions) {
   }
   const service = new ReviveService(ctx as never, {
     prompt: () => '继续',
-    scanTtlMs: 0,
+    scanTtlMs: options.scanTtlMs ?? 0,
+    scanConcurrency: options.scanConcurrency,
     resolveAgent,
   })
   return { ctx, service, followed, resumed, resolveAgent }
@@ -153,6 +156,80 @@ describe('ReviveService.scan', () => {
     const snapshot = await service.scan(true)
     expect(snapshot.items).toHaveLength(0)
     expect(snapshot.runningLive).toBe(1)
+  })
+
+  it('starts cold reads lazily and never exceeds scanConcurrency', async () => {
+    const records = Array.from({ length: 6 }, (_, index) => ({
+      header: header(String(index)),
+      live: false,
+      persisted: true,
+    }))
+    const { service, ctx } = harness({
+      records,
+      logs: new Map(),
+      scanConcurrency: 2,
+    })
+    let active = 0
+    let maxActive = 0
+    let releaseReads!: () => void
+    const readGate = new Promise<void>(resolve => { releaseReads = resolve })
+    ctx.sessionQuery.readSession.mockImplementation(async () => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await readGate
+      active -= 1
+      return { events: KILLED_EVENTS }
+    })
+
+    const pending = service.scan(true)
+    await vi.waitFor(() => expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(2))
+    expect(maxActive).toBe(2)
+    // If reads were represented by eager Promises, all six calls would have
+    // started before this gate was released.
+    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(2)
+
+    releaseReads()
+    const snapshot = await pending
+    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(6)
+    expect(maxActive).toBe(2)
+    expect(snapshot.items).toHaveLength(6)
+  })
+
+  it('shares an in-flight scan and lets force bypass only a completed cache', async () => {
+    const { service, ctx } = harness({
+      records: [],
+      logs: new Map(),
+      scanTtlMs: 60_000,
+    })
+    let releaseList!: (records: SessionRecord[]) => void
+    const listGate = new Promise<SessionRecord[]>(resolve => { releaseList = resolve })
+    ctx.sessionQuery.listSessions.mockImplementationOnce(() => listGate)
+
+    const first = service.scan()
+    const concurrent = service.scan()
+    const forcedConcurrent = service.scan(true)
+    expect(concurrent).toBe(first)
+    expect(forcedConcurrent).toBe(first)
+    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(1)
+
+    releaseList([])
+    const completed = await first
+    expect(await service.scan()).toBe(completed)
+    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(1)
+
+    const forcedRefresh = service.scan(true)
+    expect(forcedRefresh).not.toBe(first)
+    await forcedRefresh
+    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the in-flight scan after rejection so a later call can retry', async () => {
+    const { service, ctx } = harness({ records: [], logs: new Map() })
+    ctx.sessionQuery.listSessions.mockRejectedValueOnce(new Error('scan exploded'))
+
+    await expect(service.scan(true)).rejects.toThrow('scan exploded')
+    await expect(service.scan(true)).resolves.toMatchObject({ totalPersisted: 0 })
+    expect(ctx.sessionQuery.listSessions).toHaveBeenCalledTimes(2)
   })
 })
 

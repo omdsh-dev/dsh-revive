@@ -91,7 +91,8 @@ export interface ReviveServiceOptions {
 
 interface WorkItem {
   readonly record: SessionRecord
-  readonly events: Promise<readonly SessionEvent[]> | readonly SessionEvent[]
+  /** Start loading this session's events only when a scan worker is ready. */
+  readonly readEvents: () => Promise<readonly SessionEvent[]> | readonly SessionEvent[]
 }
 
 const DEFAULT_SCAN_TTL_MS = 120_000
@@ -99,6 +100,7 @@ const DEFAULT_SCAN_CONCURRENCY = 4
 
 export class ReviveService {
   private cache: { readonly at: number; readonly result: ReviveScanResult } | undefined
+  private scanInFlight: Promise<ReviveScanResult> | undefined
   private readonly inFlight = new Map<string, Promise<Agent>>()
   private readonly resolveAgent: (sessionId: SessionId, inspected: InspectedSession) => Promise<Agent>
 
@@ -110,11 +112,36 @@ export class ReviveService {
   }
 
   /** Scan the corpus and report every revivable session. */
-  async scan(force = false): Promise<ReviveScanResult> {
+  scan(force = false): Promise<ReviveScanResult> {
+    // Prefer the current refresh over a completed cache entry. In particular,
+    // a forced caller must join an already-running scan rather than launch a
+    // second corpus walk beside it.
+    if (this.scanInFlight !== undefined) return this.scanInFlight
+
     const now = Date.now()
     if (!force && this.cache !== undefined && now - this.cache.at < (this.options.scanTtlMs ?? DEFAULT_SCAN_TTL_MS)) {
-      return this.cache.result
+      return Promise.resolve(this.cache.result)
     }
+
+    const pending = this.scanCorpus()
+    this.scanInFlight = pending
+    // Settle single-flight state on both outcomes without creating a floating
+    // rejected promise. A failed refresh leaves the last completed cache intact.
+    void pending.then(
+      (result) => {
+        if (this.scanInFlight === pending) this.scanInFlight = undefined
+        this.cache = { at: Date.now(), result }
+      },
+      () => {
+        if (this.scanInFlight === pending) this.scanInFlight = undefined
+      },
+    )
+    return pending
+  }
+
+  /** Perform one uncached corpus walk. Call through {@link scan}. */
+  private async scanCorpus(): Promise<ReviveScanResult> {
+    const generatedAt = Date.now()
     const records = await this.ctx.sessionQuery.listSessions()
     const work: WorkItem[] = []
     let runningLive = 0
@@ -138,33 +165,48 @@ export class ReviveService {
           runningLive += 1
           continue
         }
-        work.push({ record, events: session.events })
+        work.push({ record, readEvents: () => session.events })
         continue
       }
       work.push({
         record,
-        events: this.ctx.sessionQuery.readSession(header.id).then(snapshot => snapshot.events),
+        readEvents: async () => (await this.ctx.sessionQuery.readSession(header.id)).events,
       })
     }
 
-    const items: ReviveCandidate[] = []
-    const batch = this.options.scanConcurrency ?? DEFAULT_SCAN_CONCURRENCY
-    for (let offset = 0; offset < work.length; offset += batch) {
-      const settled = await Promise.allSettled(work.slice(offset, offset + batch).map(async item => {
-        const events = await item.events
-        const health = detectHealth(events)
-        if (health.state !== 'interrupted') return undefined
-        return {
-          sessionId: item.record.header.id,
-          reason: health.reason,
-          live: item.record.live,
-          createdAt: item.record.header.createdAt,
+    const requestedConcurrency = this.options.scanConcurrency ?? DEFAULT_SCAN_CONCURRENCY
+    const concurrency = Number.isFinite(requestedConcurrency) && requestedConcurrency > 0
+      ? Math.max(1, Math.floor(requestedConcurrency))
+      : DEFAULT_SCAN_CONCURRENCY
+    const candidates: Array<ReviveCandidate | undefined> = new Array(work.length)
+    let nextIndex = 0
+    const worker = async (): Promise<void> => {
+      while (nextIndex < work.length) {
+        const index = nextIndex
+        nextIndex += 1
+        const item = work[index]
+        try {
+          const events = await item.readEvents()
+          const health = detectHealth(events)
+          if (health.state === 'interrupted') {
+            candidates[index] = {
+              sessionId: item.record.header.id,
+              reason: health.reason,
+              live: item.record.live,
+              createdAt: item.record.header.createdAt,
+            }
+          }
+        } catch {
+          // Preserve the previous allSettled behavior: one unreadable session
+          // does not prevent the rest of the persisted corpus from being scanned.
         }
-      }))
-      for (const outcome of settled) {
-        if (outcome.status === 'fulfilled' && outcome.value !== undefined) items.push(outcome.value)
       }
     }
+    await Promise.all(Array.from(
+      { length: Math.min(concurrency, work.length) },
+      () => worker(),
+    ))
+    const items = candidates.filter((candidate): candidate is ReviveCandidate => candidate !== undefined)
 
     const titles = await this.titlesFor(items.map(item => item.sessionId))
     const titled = items.map((item, index) => ({ ...item, title: titles[index] }))
@@ -173,9 +215,8 @@ export class ReviveService {
       totalPersisted: records.length,
       runningLive,
       skipped,
-      generatedAt: now,
+      generatedAt,
     }
-    this.cache = { at: now, result }
     return result
   }
 
