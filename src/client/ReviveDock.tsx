@@ -71,7 +71,9 @@ export function ReviveDock(props: ReviveDockProps) {
         // A failed poll keeps the last snapshot; the next tick retries.
       }
     }
-    void refresh(true)
+    // A remount should reuse the host snapshot cache; only an explicit revive
+    // action below forces a corpus rescan.
+    void refresh()
     const timer = setInterval(() => { void refresh() }, POLL_MS)
     return () => {
       disposed = true
