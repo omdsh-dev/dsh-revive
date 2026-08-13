@@ -1,7 +1,10 @@
-import { existsSync, lstatSync, mkdirSync, readlinkSync, symlinkSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, symlinkSync, unlinkSync } from 'node:fs'
 import { dirname, relative, resolve } from 'node:path'
 
 const root = process.cwd()
+const runtimeRoot = process.env.DSH_RUNTIME_NODE_MODULES === undefined
+  ? undefined
+  : resolve(process.env.DSH_RUNTIME_NODE_MODULES)
 const workspaceRoot = process.env.DSH_WORKSPACE_ROOT === undefined
   ? resolve(root, '../dsh-workspace')
   : resolve(process.env.DSH_WORKSPACE_ROOT)
@@ -25,12 +28,18 @@ const links = {
   '@deepseek-ai/dsh-client-ui-conversation': 'packages/client/ui-conversation',
 }
 
-if (!existsSync(workspaceRoot)) {
-  throw new Error(`DSH workspace does not exist: ${workspaceRoot}. Set DSH_WORKSPACE_ROOT to a local DSH workspace.`)
+if (runtimeRoot === undefined && !existsSync(workspaceRoot)) {
+  throw new Error(`Set DSH_RUNTIME_NODE_MODULES to an installed DSH node_modules, or DSH_WORKSPACE_ROOT to a local DSH workspace.`)
+}
+if (runtimeRoot !== undefined) {
+  const manifest = JSON.parse(readFileSync(resolve(runtimeRoot, '@deepseek-ai/dsh/package.json'), 'utf8'))
+  if (!isCompatibleDshVersion(manifest.version)) {
+    throw new Error(`DSH must satisfy >=0.1.0-rc.3 <0.2.0; found ${String(manifest.version)}`)
+  }
 }
 
 for (const [packageName, workspacePath] of Object.entries(links)) {
-  const target = resolve(workspaceRoot, workspacePath)
+  const target = runtimeRoot === undefined ? resolve(workspaceRoot, workspacePath) : resolve(runtimeRoot, packageName)
   const destination = resolve(root, 'node_modules', packageName)
   if (!existsSync(target)) throw new Error(`DSH package source does not exist: ${target}`)
   ensureLink(destination, target)
@@ -42,8 +51,10 @@ function ensureLink(destination, target) {
     if (lstatSync(destination).isSymbolicLink()) {
       const current = resolve(dirname(destination), readlinkSync(destination))
       if (current === target) return
+      unlinkSync(destination)
+    } else {
+      throw new Error(`Refusing to replace existing dependency: ${destination}`)
     }
-    throw new Error(`Refusing to replace existing dependency: ${destination}`)
   }
   const linkTarget = process.platform === 'win32' ? target : relative(dirname(destination), target)
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -54,6 +65,13 @@ function ensureLink(destination, target) {
       if (attempt === 1 || pathExists(destination)) throw error
     }
   }
+}
+
+function isCompatibleDshVersion(version) {
+  const match = /^0\.1\.(\d+)(?:-rc\.(\d+))?$/.exec(String(version))
+  if (match === null) return false
+  const patch = Number(match[1])
+  return patch > 0 || match[2] === undefined || Number(match[2]) >= 3
 }
 
 function pathExists(path) {

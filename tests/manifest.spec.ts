@@ -18,24 +18,24 @@ async function manifest(): Promise<PackageManifest> {
   return JSON.parse(await readFile(new URL('package.json', root), 'utf8')) as PackageManifest
 }
 
-describe('DSH rc.2 package contract', () => {
+describe('DSH 0.1.0-rc.3 package contract', () => {
   it('ships one Profile Bundle and a discoverable web client', async () => {
     const pkg = await manifest()
 
-    expect(pkg.version).toBe('0.1.3')
+    expect(pkg.version).toBe('0.1.4')
     expect(pkg.dsh.bundle.patch).toBe('./cordis.patch.yml')
     expect(pkg.exports).toHaveProperty('./client')
     expect(pkg.dsh.client.platform).toBe('web')
     expect(pkg.dsh.client.inject).toContain('@deepseek-ai/dsh-client-ui-conversation')
   })
 
-  it('pins every DSH peer to a range that accepts rc.2', async () => {
+  it('pins every DSH peer to a range that accepts 0.1.0-rc.3', async () => {
     const pkg = await manifest()
     const dshPeers = Object.entries(pkg.peerDependencies)
       .filter(([name]) => name.startsWith('@deepseek-ai/dsh-'))
 
     expect(dshPeers.length).toBeGreaterThan(0)
-    for (const [, range] of dshPeers) expect(range).toBe('>=0.0.1-rc.2 <0.0.2')
+    for (const [, range] of dshPeers) expect(range).toBe('>=0.1.0-rc.3 <0.2.0')
   })
 
   it('uses scoped framework packages and never reintroduces session-query', async () => {

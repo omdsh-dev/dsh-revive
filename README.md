@@ -31,7 +31,7 @@ DSH 进程经常在跑任务时被杀死（自己杀自己、OOM、崩溃……�
 
 ```bash
 # 已登录私有 npm registry 的 DSH 部署机
-dsh plugin --profile web add dsh-revive@0.1.3
+dsh plugin --profile web add dsh-revive@0.1.4
 
 # 本地开发 checkout
 dsh plugin --profile web add link:/path/to/dsh-revive
@@ -46,11 +46,11 @@ loader entry，否则会触发 `duplicate loader entry id`。重启 DSH 后，�
 
 | 组件 | 支持范围 |
 |---|---|
-| DSH | `>=0.0.1-rc.2 <0.0.2` |
+| DSH | `>=0.1.0-rc.3 <0.2.0` |
 | Node.js | `>=22.19.0` |
 | Profile | `web`（宿主命令/工具/RPC + 浏览器 dock） |
 
-0.1.3 以 DSH 0.0.1-rc.2 的 commands、agent resume、raw session persistence 和
+0.1.4 以 npm DSH 0.1.0-rc.3 的 commands、agent resume、raw session persistence 和
 `dsh-client-ui-conversation` 契约为准。
 
 ## 配置
@@ -80,7 +80,7 @@ loader entry，否则会触发 `duplicate loader entry id`。重启 DSH 后，�
 
 ```bash
 npm install --legacy-peer-deps
-DSH_WORKSPACE_ROOT=/path/to/dsh-rc2-source npm run setup:dsh-workspace
+DSH_RUNTIME_NODE_MODULES=/path/to/dsh-0.1.0-rc.3/node_modules npm run setup:dsh-workspace
 npm run typecheck
 npm test
 npm run build                 # tsc（host 半部）+ tsdown（浏览器半部 lib/client.js）
@@ -88,7 +88,7 @@ npm run test:oom              # 128 MiB V8 heap 下扫描 32 MiB raw JSONL
 npm pack                      # prepack 会重跑全部 gate
 ```
 
-依赖的真实类型在 `setup:dsh-workspace` 时从 DSH 源码 workspace 软链而来（内部包不在公共 npm 上）；若 checkout 路径不同，用 `DSH_WORKSPACE_ROOT=<path> npm run setup:dsh-workspace` 指定。
+依赖的真实类型在 `setup:dsh-workspace` 时从已安装的私有 npm DSH 运行时软链而来；用 `DSH_RUNTIME_NODE_MODULES=<path> npm run setup:dsh-workspace` 指定该运行时的 `node_modules`。
 
 ## 已知限制
 
