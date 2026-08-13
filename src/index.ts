@@ -20,6 +20,7 @@ import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/cordis-plugin-timer'
 import type {} from '@deepseek-ai/dsh-commands'
 import type {} from '@deepseek-ai/dsh-tools'
+import z from 'schemastery'
 import { registerReviveCommand } from './command.ts'
 import { registerReviveRpc } from './rpc.ts'
 import { registerReviveTool } from './tool.ts'
@@ -38,14 +39,26 @@ export interface Config {
   autoReviveOnStartup?: boolean
   /** Startup delay for auto-revive in milliseconds. Default 5000. */
   startupDelayMs?: number
-  /** Snapshot cache TTL in milliseconds. Default 5000. */
+  /** Snapshot cache TTL in milliseconds. Default 120000. */
   scanTtlMs?: number
+  /** Maximum simultaneous cold-session log reads. Default 1. */
+  scanConcurrency?: number
 }
+
+/** Loader-visible configuration schema and defaults. */
+export const Config: z<Config> = z.object({
+  resumePrompt: z.string().default('继续').description('复活会话时发送的指令文本。'),
+  autoReviveOnStartup: z.boolean().default(false).description('DSH 启动后自动复活所有被打断的会话。'),
+  startupDelayMs: z.number().step(1).min(0).default(5_000).description('自动复活的启动延迟（毫秒）。'),
+  scanTtlMs: z.number().step(1).min(0).default(120_000).description('已完成扫描快照的缓存时间（毫秒）。'),
+  scanConcurrency: z.number().step(1).min(1).default(1).description('同时读取的冷会话日志数；巨型日志场景建议保持 1。'),
+})
 
 export function apply(ctx: Context, config: Config = {}): void {
   const service = new ReviveService(ctx, {
     prompt: () => config.resumePrompt ?? '继续',
     ...config.scanTtlMs === undefined ? {} : { scanTtlMs: config.scanTtlMs },
+    ...config.scanConcurrency === undefined ? {} : { scanConcurrency: config.scanConcurrency },
   })
 
   ctx.effect(() => registerReviveCommand(ctx, service), 'dsh-revive: command')

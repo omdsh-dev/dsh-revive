@@ -96,7 +96,8 @@ interface WorkItem {
 }
 
 const DEFAULT_SCAN_TTL_MS = 120_000
-const DEFAULT_SCAN_CONCURRENCY = 4
+/** Serialize cold-log reads by default: one giant log can approach the V8 heap limit alone. */
+export const DEFAULT_SCAN_CONCURRENCY = 1
 
 export class ReviveService {
   private cache: { readonly at: number; readonly result: ReviveScanResult } | undefined

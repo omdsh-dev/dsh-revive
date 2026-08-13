@@ -8,3 +8,5 @@
       #   resumePrompt: 继续            # 复活时发送给会话的指令
       #   autoReviveOnStartup: true    # DSH 启动后自动复活（默认关闭，防崩溃循环）
       #   startupDelayMs: 5000          # 自动复活的启动延迟
+      #   scanTtlMs: 120000             # 已完成扫描快照缓存时间
+      #   scanConcurrency: 1            # 冷日志读取并发；巨型会话建议保持 1

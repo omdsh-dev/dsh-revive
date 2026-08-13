@@ -158,6 +158,37 @@ describe('ReviveService.scan', () => {
     expect(snapshot.runningLive).toBe(1)
   })
 
+  it('serializes cold reads by default', async () => {
+    const records = Array.from({ length: 3 }, (_, index) => ({
+      header: header(String(index)),
+      live: false,
+      persisted: true,
+    }))
+    const { service, ctx } = harness({ records, logs: new Map() })
+    let active = 0
+    let maxActive = 0
+    let releaseReads!: () => void
+    const readGate = new Promise<void>(resolve => { releaseReads = resolve })
+    ctx.sessionQuery.readSession.mockImplementation(async () => {
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      await readGate
+      active -= 1
+      return { events: KILLED_EVENTS }
+    })
+
+    const pending = service.scan(true)
+    await vi.waitFor(() => expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(1))
+    expect(maxActive).toBe(1)
+    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(1)
+
+    releaseReads()
+    const snapshot = await pending
+    expect(ctx.sessionQuery.readSession).toHaveBeenCalledTimes(3)
+    expect(maxActive).toBe(1)
+    expect(snapshot.items).toHaveLength(3)
+  })
+
   it('starts cold reads lazily and never exceeds scanConcurrency', async () => {
     const records = Array.from({ length: 6 }, (_, index) => ({
       header: header(String(index)),

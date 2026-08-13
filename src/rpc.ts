@@ -20,8 +20,8 @@ export function registerReviveRpc(ctx: Context, service: ReviveService): () => v
   const handle = ctx.connection.rpc.handle(REVIVE_RPC_CHANNEL, async (endpoint, payload, _signal) => {
     try {
       switch (endpoint) {
-        // `refresh: true` bypasses the snapshot cache (the widget asks for a
-        // fresh scan on mount; ordinary polls reuse the cached snapshot).
+        // `refresh: true` bypasses a completed snapshot cache. Widget mount
+        // and ordinary polls reuse the cache; explicit user actions refresh.
         case 'snapshot': {
           const refresh = (payload as { refresh?: boolean } | undefined)?.refresh === true
           return ok(await service.scan(refresh))
