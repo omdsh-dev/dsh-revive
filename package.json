@@ -1,6 +1,6 @@
 {
   "name": "dsh-revive",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "DSH 一键复活：重启后给所有被打断的会话自动发送「继续」指令（/revive 命令 + revive_sessions 工具 + 浏览器一键按钮）",
   "license": "BSD-3-Clause",
   "type": "module",
